@@ -153,6 +153,9 @@ interface ActionQueueSnapshot {
   executing: ActionQueueEntryView | null
   pending: ActionQueueEntryView[]
   recent: ActionQueueEntryView[]
+  workerRunning: boolean
+  lastProgressAt: number
+  watchdogTimeoutMs: number
   capacity: {
     total: number
     executing: number
@@ -176,6 +179,8 @@ interface ControlActionQueueEntry {
   finishedAt?: number
   result?: unknown
   error?: string
+  resolve?: (result: unknown) => void
+  reject?: (error: Error) => void
 }
 
 interface NoActionBudgetState {
@@ -192,6 +197,8 @@ interface ErrorBurstGuardState {
   recentErrorSummary: string[]
   triggeredAtTurnId: number
 }
+
+class ControlActionTimeoutError extends Error {}
 
 function truncateForPrompt(value: string, maxLength = 220): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}...`
@@ -222,6 +229,7 @@ const EVENT_PRIORITY_NO_ACTION_FOLLOWUP = 3
 const MAX_QUEUED_CONTROL_ACTIONS = 5
 const MAX_PENDING_CONTROL_ACTIONS = 4
 const ACTION_QUEUE_RECENT_HISTORY_LIMIT = 20
+const CONTROL_ACTION_TIMEOUT_MS = 30_000
 const MAX_CONVERSATION_HISTORY_MESSAGES = 200
 const HANDOFF_TOKEN_THRESHOLD = 20000
 const NO_ACTION_FOLLOWUP_BUDGET_DEFAULT = 3
@@ -285,6 +293,7 @@ export class Brain {
   private recentControlActions: ControlActionQueueEntry[] = []
   private readonly stopCancelledControlActionIds = new Set<number>()
   private actionQueueUpdatedAt = Date.now()
+  private actionQueueLastProgressAt = Date.now()
   private isActionWorkerRunning = false
   private completedControlActionsSinceLastFeedback = 0
   private noActionFollowupBudgetRemaining = NO_ACTION_FOLLOWUP_BUDGET_DEFAULT
@@ -393,6 +402,11 @@ export class Brain {
       this.onActionFailed = null
     }
     this.currentCancellationToken?.cancel()
+
+    if (this.activeControlAction?.reject) {
+      this.activeControlAction.reject(new Error('Brain destroyed'))
+    }
+
     this.clearPendingControlActions('cancelled')
     this.activeControlAction = null
     this.stopCancelledControlActionIds.clear()
@@ -1087,6 +1101,32 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
     this.actionQueueUpdatedAt = Date.now()
   }
 
+  private markActionQueueProgress(): void {
+    this.actionQueueLastProgressAt = Date.now()
+    this.touchActionQueue()
+  }
+
+  private async executeControlActionWithWatchdog(
+    entry: ControlActionQueueEntry,
+    cancellationToken: CancellationToken,
+  ): Promise<unknown> {
+    const actionPromise = this.deps.taskExecutor.executeActionWithResult(entry.action, cancellationToken)
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        cancellationToken.cancel()
+        reject(new ControlActionTimeoutError(
+          `Control action timed out after ${CONTROL_ACTION_TIMEOUT_MS}ms: ${entry.action.tool}`,
+        ))
+      }, CONTROL_ACTION_TIMEOUT_MS)
+    })
+    return Promise.race([actionPromise, timeoutPromise]).finally(() => {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle)
+      }
+    })
+  }
+
   private cloneActionParams(params: Record<string, unknown>): Record<string, unknown> {
     return JSON.parse(JSON.stringify(params)) as Record<string, unknown>
   }
@@ -1130,6 +1170,9 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
       executing,
       pending,
       recent,
+      workerRunning: this.isActionWorkerRunning,
+      lastProgressAt: this.actionQueueLastProgressAt,
+      watchdogTimeoutMs: CONTROL_ACTION_TIMEOUT_MS,
       capacity: {
         total: MAX_QUEUED_CONTROL_ACTIONS,
         executing: 1,
@@ -1168,6 +1211,10 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
       entry.finishedAt = clearedAt
       entry.error = state === 'failed' ? entry.error : entry.error ?? 'Cleared from action queue'
       this.pushRecentControlAction(entry)
+
+      if (entry.reject) {
+        entry.reject(new Error(entry.error))
+      }
     }
     this.touchActionQueue()
     return cleared.length
@@ -1183,41 +1230,38 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
       throw new Error(`Action queue full (${queueSize}/${MAX_QUEUED_CONTROL_ACTIONS}). Use stop() or wait for completion.`)
     }
 
-    const entry: ControlActionQueueEntry = {
-      id: ++this.nextControlActionId,
-      action: {
-        tool: action.tool,
-        params: this.cloneActionParams(action.params),
-      },
-      sourceTurnId,
-      state: 'pending',
-      enqueuedAt: Date.now(),
-    }
-    this.pendingControlActions.push(entry)
-    this.touchActionQueue()
+    return new Promise((resolve, reject) => {
+      const entry: ControlActionQueueEntry = {
+        id: ++this.nextControlActionId,
+        action: {
+          tool: action.tool,
+          params: this.cloneActionParams(action.params),
+        },
+        sourceTurnId,
+        state: 'pending',
+        enqueuedAt: Date.now(),
+        resolve,
+        reject,
+      }
+      this.pendingControlActions.push(entry)
+      this.touchActionQueue()
 
-    this.appendLlmLog({
-      turnId: sourceTurnId,
-      kind: 'scheduler',
-      eventType: 'system_alert',
-      sourceType: 'system',
-      sourceId: 'brain:action_queue',
-      tags: ['scheduler', 'action_queue', 'enqueued'],
-      text: `Queued control action #${entry.id}: ${entry.action.tool}`,
-      metadata: {
-        actionId: entry.id,
-        pendingCount: this.pendingControlActions.length,
-      },
+      this.appendLlmLog({
+        turnId: sourceTurnId,
+        kind: 'scheduler',
+        eventType: 'system_alert',
+        sourceType: 'system',
+        sourceId: 'brain:action_queue',
+        tags: ['scheduler', 'action_queue', 'enqueued'],
+        text: `Queued control action #${entry.id}: ${entry.action.tool}`,
+        metadata: {
+          actionId: entry.id,
+          pendingCount: this.pendingControlActions.length,
+        },
+      })
+
+      this.startControlActionWorker(bot)
     })
-
-    this.startControlActionWorker(bot)
-    return {
-      queued: true,
-      actionId: entry.id,
-      state: entry.state,
-      pendingAhead: Math.max(0, this.pendingControlActions.length - 1),
-      queue: this.getActionQueueSnapshot().counts,
-    }
   }
 
   private startControlActionWorker(bot: MineflayerWithAgents): void {
@@ -1225,6 +1269,7 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
       return
 
     this.isActionWorkerRunning = true
+    this.markActionQueueProgress()
     setImmediate(() => {
       void this.runControlActionWorker(bot)
     })
@@ -1237,7 +1282,7 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
         entry.state = 'executing'
         entry.startedAt = Date.now()
         this.activeControlAction = entry
-        this.touchActionQueue()
+        this.markActionQueueProgress()
 
         this.appendLlmLog({
           turnId: entry.sourceTurnId,
@@ -1260,7 +1305,7 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
         this.currentCancellationToken = cancellationToken
 
         try {
-          const result = await this.deps.taskExecutor.executeActionWithResult(entry.action, cancellationToken)
+          const result = await this.executeControlActionWithWatchdog(entry, cancellationToken)
           const cancelledByStop = cancellationToken.isCancelled || this.stopCancelledControlActionIds.has(entry.id)
           if (cancelledByStop) {
             entry.state = 'cancelled'
@@ -1282,9 +1327,13 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
               },
             })
 
+            if (entry.reject) {
+              entry.reject(new Error('Cancelled by stop action'))
+            }
+
             this.stopCancelledControlActionIds.delete(entry.id)
             this.activeControlAction = null
-            this.touchActionQueue()
+            this.markActionQueueProgress()
             continue
           }
 
@@ -1304,13 +1353,17 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
             text: `Control action #${entry.id} succeeded: ${entry.action.tool}`,
           })
 
+          if (entry.resolve) {
+            entry.resolve(result)
+          }
+
           this.activeControlAction = null
-          this.touchActionQueue()
+          this.markActionQueueProgress()
 
           if (this.pendingControlActions.length === 0) {
             const completedCount = this.completedControlActionsSinceLastFeedback
             this.completedControlActionsSinceLastFeedback = 0
-            await this.enqueueEvent(bot, {
+            void this.enqueueEvent(bot, {
               type: 'feedback',
               payload: {
                 status: 'success',
@@ -1323,14 +1376,17 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
               },
               source: { type: 'system', id: 'executor' },
               timestamp: Date.now(),
-            })
+            }).catch(err =>
+              this.deps.logger.withError(err).error('Brain: Failed to enqueue success feedback after queue drain'),
+            )
           }
         }
         catch (err) {
+          const timedOut = err instanceof ControlActionTimeoutError
           const interrupted = err instanceof ActionError && err.code === 'INTERRUPTED'
-          const cancelledByStop = cancellationToken.isCancelled
-            || interrupted
-            || this.stopCancelledControlActionIds.has(entry.id)
+          const cancelledByStop = !timedOut && (cancellationToken.isCancelled
+            || (interrupted && !timedOut)
+            || this.stopCancelledControlActionIds.has(entry.id))
 
           if (cancelledByStop) {
             entry.state = 'cancelled'
@@ -1352,9 +1408,13 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
               },
             })
 
+            if (entry.reject) {
+              entry.reject(new Error('Cancelled by stop action'))
+            }
+
             this.stopCancelledControlActionIds.delete(entry.id)
             this.activeControlAction = null
-            this.touchActionQueue()
+            this.markActionQueueProgress()
             continue
           }
 
@@ -1364,10 +1424,14 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
           entry.finishedAt = Date.now()
           this.pushRecentControlAction(entry)
 
+          if (entry.reject) {
+            entry.reject(new Error(errorMessage))
+          }
+
           const clearedCount = this.clearPendingControlActions('cancelled')
           this.completedControlActionsSinceLastFeedback = 0
           this.activeControlAction = null
-          this.touchActionQueue()
+          this.markActionQueueProgress()
 
           this.appendLlmLog({
             turnId: entry.sourceTurnId,
@@ -1380,11 +1444,13 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
             metadata: {
               actionId: entry.id,
               clearedPendingCount: clearedCount,
+              elapsedMs: Date.now() - (entry.startedAt ?? entry.enqueuedAt),
+              timedOut,
               error: errorMessage,
             },
           })
 
-          await this.enqueueEvent(bot, {
+          void this.enqueueEvent(bot, {
             type: 'feedback',
             payload: {
               status: 'failure',
@@ -1397,7 +1463,9 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
             },
             source: { type: 'system', id: 'executor' },
             timestamp: Date.now(),
-          })
+          }).catch(enqueueErr =>
+            this.deps.logger.withError(enqueueErr).error('Brain: Failed to enqueue failure feedback'),
+          )
           break
         }
         finally {
@@ -1409,6 +1477,7 @@ mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
     }
     finally {
       this.isActionWorkerRunning = false
+      this.markActionQueueProgress()
       if (this.pendingControlActions.length > 0 && this.runtimeMineflayer) {
         this.startControlActionWorker(this.runtimeMineflayer)
       }

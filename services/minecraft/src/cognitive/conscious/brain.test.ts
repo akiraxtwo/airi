@@ -39,7 +39,7 @@ function createDeps(llmText: string) {
   logger.withError.mockReturnValue(logger)
 
   return {
-    eventBus: { subscribe: vi.fn() },
+    eventBus: { subscribe: vi.fn(), emit: vi.fn() },
     llmAgent: {
       callLLM: vi.fn(async () => ({ text: llmText, reasoning: '', usage: {} })),
     },
@@ -469,26 +469,38 @@ describe('brain queue coalescing', () => {
 })
 
 describe('brain control action queue', () => {
-  it('does not block turn completion while control action executes in worker', async () => {
+  it('blocks REPL evaluation until control action completes', async () => {
     const deps: any = createDeps('await goToPlayer({ player_name: "Alex", closeness: 2 })')
-    const deferred = new Promise<unknown>(() => {})
+    let resolveAction: (value: unknown) => void
+    const actionPromise = new Promise<unknown>((resolve) => {
+      resolveAction = resolve
+    })
     deps.taskExecutor.getAvailableActions = vi.fn(() => [createAsyncControlAction('goToPlayer')])
     deps.taskExecutor.executeActionWithResult = vi.fn(async (action: any) => {
       if (action.tool === 'goToPlayer')
-        return deferred
+        return actionPromise
       return 'ok'
     })
 
     const brain: any = new Brain(deps)
-    const outcome = await Promise.race([
-      brain.processEvent({} as any, createPerceptionEvent()).then(() => 'done'),
-      new Promise(resolve => setTimeout(() => resolve('timeout'), 80)),
-    ])
+    const processPromise = brain.processEvent({} as any, createPerceptionEvent())
 
-    expect(outcome).toBe('done')
-    const snapshot = brain.getDebugSnapshot()
+    // Give it time to start processing
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    // Action should be executing but REPL should not have completed
+    let snapshot = brain.getDebugSnapshot()
     expect(snapshot.actionQueue.counts.total).toBe(1)
-    expect(snapshot.actionQueue.executing?.tool ?? snapshot.actionQueue.pending[0]?.tool).toBe('goToPlayer')
+    expect(snapshot.actionQueue.executing?.tool).toBe('goToPlayer')
+
+    // Resolve the action
+    resolveAction!('moved to Alex')
+
+    // Now the REPL should complete
+    await processPromise
+
+    snapshot = brain.getDebugSnapshot()
+    expect(snapshot.actionQueue.counts.total).toBe(0)
   })
 
   it('executes readonly tools immediately without consuming control queue', async () => {
@@ -531,7 +543,8 @@ describe('brain control action queue', () => {
       interrupt: vi.fn(),
     }
 
-    await brain.enqueueControlAction(bot, {
+    // enqueueControlAction now returns a promise that rejects on cancellation
+    const enqueuePromise = brain.enqueueControlAction(bot, {
       tool: 'goToPlayer',
       params: { player_name: 'Alex', closeness: 2 },
     }, 1)
@@ -540,6 +553,9 @@ describe('brain control action queue', () => {
 
     await brain.executeStopAction(bot, 2)
     await new Promise(resolve => setTimeout(resolve, 20))
+
+    // The promise should reject with cancellation error
+    await expect(enqueuePromise).rejects.toThrow('Cancelled by stop action')
 
     const snapshot = brain.getDebugSnapshot()
     const cancelledEntry = snapshot.actionQueue.recent.find((entry: any) => entry.tool === 'goToPlayer')
@@ -554,5 +570,71 @@ describe('brain control action queue', () => {
         && event?.payload?.action?.tool === 'goToPlayer'
     })
     expect(goToPlayerFailure).toBeUndefined()
+  })
+
+  it('does not deadlock control worker when feedback enqueue is blocked', async () => {
+    const deps: any = createDeps('await skip()')
+    deps.taskExecutor.getAvailableActions = vi.fn(() => [createAsyncControlAction('goToPlayer')])
+    deps.taskExecutor.executeActionWithResult = vi.fn(async (action: any) => {
+      if (action.params.player_name === 'first')
+        throw new Error('first action failed')
+      return 'second action ok'
+    })
+
+    const brain: any = new Brain(deps)
+    brain.enqueueEvent = vi.fn(() => new Promise(() => {}))
+    const bot = { interrupt: vi.fn() }
+
+    const first = brain.enqueueControlAction(bot, {
+      tool: 'goToPlayer',
+      params: { player_name: 'first', closeness: 2 },
+    }, 1)
+    await expect(first).rejects.toThrow('first action failed')
+
+    const second = brain.enqueueControlAction(bot, {
+      tool: 'goToPlayer',
+      params: { player_name: 'second', closeness: 2 },
+    }, 2)
+    await expect(second).resolves.toBe('second action ok')
+
+    const snapshot = brain.getDebugSnapshot()
+    expect(snapshot.actionQueue.counts.total).toBe(0)
+    expect(snapshot.actionQueue.workerRunning).toBe(false)
+  })
+
+  it('fails timed-out control action and unblocks queue', async () => {
+    vi.useFakeTimers()
+    try {
+      const deps: any = createDeps('await skip()')
+      deps.taskExecutor.getAvailableActions = vi.fn(() => [createAsyncControlAction('goToPlayer')])
+      deps.taskExecutor.executeActionWithResult = vi.fn(() => new Promise(() => {}))
+
+      const brain: any = new Brain(deps)
+      const bot = { interrupt: vi.fn() }
+
+      const actionPromise = brain.enqueueControlAction(bot, {
+        tool: 'goToPlayer',
+        params: { player_name: 'stalled', closeness: 2 },
+      }, 1)
+      const timeoutErrorPromise = actionPromise.catch((err: Error) => err)
+
+      await vi.advanceTimersByTimeAsync(30_000)
+      const timeoutError = await timeoutErrorPromise
+      expect(timeoutError.message).toContain('Control action timed out')
+
+      const snapshot = brain.getDebugSnapshot()
+      expect(snapshot.actionQueue.counts.total).toBe(0)
+      expect(snapshot.actionQueue.workerRunning).toBe(false)
+      expect(snapshot.actionQueue.watchdogTimeoutMs).toBe(30_000)
+      expect(snapshot.actionQueue.recent.some((entry: any) =>
+        entry.tool === 'goToPlayer'
+        && entry.state === 'failed'
+        && typeof entry.error === 'string'
+        && entry.error.includes('Control action timed out'),
+      )).toBe(true)
+    }
+    finally {
+      vi.useRealTimers()
+    }
   })
 })
