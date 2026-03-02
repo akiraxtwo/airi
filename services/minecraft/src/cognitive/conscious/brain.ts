@@ -8,7 +8,7 @@ import type { EventBus, TracedEvent } from '../event-bus'
 import type { PerceptionSignal } from '../perception/types/signals'
 import type { ReflexManager } from '../reflex/reflex-manager'
 import type { BotEvent, MineflayerWithAgents } from '../types'
-import type { ActiveContextState, ArchivedContext } from './context-summary'
+// Context summary types removed - using simple token-based handoff instead
 import type { PlannerGlobalDescriptor } from './js-planner'
 import type { LLMAgent } from './llm-agent'
 import type { LlmLogEntry, LlmLogEntryKind } from './llm-log'
@@ -17,12 +17,7 @@ import type { CancellationToken } from './task-state'
 import { config } from '../../composables/config'
 import { DebugService } from '../../debug'
 import { ActionError } from '../../utils/errors'
-import {
-
-  buildContextHistoryMessage,
-  collapseOldestContexts,
-  generateContextSummary,
-} from './context-summary'
+// Context summary functions removed - using simple token-based handoff instead
 import { buildConsciousContextView } from './context-view'
 import { createHistoryRuntime } from './history-query'
 import { JavaScriptPlanner } from './js-planner'
@@ -228,8 +223,7 @@ const MAX_QUEUED_CONTROL_ACTIONS = 5
 const MAX_PENDING_CONTROL_ACTIONS = 4
 const ACTION_QUEUE_RECENT_HISTORY_LIMIT = 20
 const MAX_CONVERSATION_HISTORY_MESSAGES = 200
-const MAX_ACTIVE_CONTEXT_MESSAGES = 30
-const MAX_CONTEXT_SUMMARIES_IN_PREFIX = 10
+const HANDOFF_TOKEN_THRESHOLD = 20000
 const NO_ACTION_FOLLOWUP_BUDGET_DEFAULT = 3
 const NO_ACTION_FOLLOWUP_BUDGET_MAX = 8
 const NO_ACTION_STAGNATION_REPEAT_LIMIT = 2
@@ -277,19 +271,10 @@ export class Brain {
   private readonly llmLogRuntime = createLlmLogRuntime(() => this.llmLogEntries)
   private readonly patternRuntime = createPatternRuntime(PATTERN_CATALOG)
 
-  // Context boundary state
-  private archivedContexts: ArchivedContext[] = []
-  private activeContextState: ActiveContextState = {
-    label: null,
-    startTurnId: 0,
-    startedAt: Date.now(),
-  }
-
-  private activeContextStartIndex = 0
-  private cachedContextHistoryMessage: string | null = null
+  // Handoff state
+  private isHandoffInProgress = false
   private readonly historyRuntime = createHistoryRuntime({
     getConversationHistory: () => this.conversationHistory,
-    getArchivedContexts: () => this.archivedContexts,
     getLlmLogEntries: () => this.llmLogEntries,
     getCurrentTurnId: () => this.turnCounter,
   })
@@ -503,205 +488,136 @@ export class Brain {
   public forgetConversation(): { ok: true, cleared: string[] } {
     this.conversationHistory = []
     this.lastLlmInputSnapshot = null
-    this.activeContextStartIndex = 0
-    this.activeContextState = { label: null, startTurnId: this.turnCounter, startedAt: Date.now() }
-    this.archivedContexts = []
-    this.cachedContextHistoryMessage = null
+    this.isHandoffInProgress = false
     this.emitConversationUpdate(false, true)
     return {
       ok: true,
-      cleared: ['conversationHistory', 'lastLlmInputSnapshot', 'contextHistory'],
+      cleared: ['conversationHistory', 'lastLlmInputSnapshot'],
     }
   }
 
   /**
-   * Enter a new task context boundary. Called by the LLM via REPL.
-   * If there's already an active context with messages, it is auto-exited first.
+   * Estimate token count for the conversation history.
+   * Uses simple heuristic: ~4 chars per token (GPT tokenization approximation).
    */
-  public enterContext(label: string): { ok: true, label: string, turnId: number } {
-    const normalizedLabel = (typeof label === 'string' && label.trim()) ? label.trim() : 'unnamed'
-
-    // If the current active context has messages, auto-exit it first
-    const activeMessageCount = this.conversationHistory.length - this.activeContextStartIndex
-    if (activeMessageCount > 0) {
-      this.exitCurrentContext(undefined, 'auto_exit_on_enter')
+  private estimateConversationTokens(): number {
+    let charCount = 0
+    for (const msg of this.conversationHistory) {
+      const content = typeof msg.content === 'string' ? msg.content : ''
+      charCount += content.length
+      // Check for reasoning field (present in some message types)
+      const reasoning = (msg as any).reasoning
+      if (typeof reasoning === 'string') {
+        charCount += reasoning.length
+      }
     }
+    return Math.ceil(charCount / 4)
+  }
 
-    this.activeContextState = {
-      label: normalizedLabel,
-      startTurnId: this.turnCounter,
-      startedAt: Date.now(),
-    }
-    this.activeContextStartIndex = this.conversationHistory.length
+  /**
+   * Trigger context handoff: LLM writes memories, then conversation resets.
+   * Original history remains queryable via history runtime.
+   */
+  private async triggerContextHandoff(bot: MineflayerWithAgents, event: BotEvent): Promise<void> {
+    this.isHandoffInProgress = true
+    const estimatedTokens = this.estimateConversationTokens()
+    const turnId = ++this.turnCounter
 
     this.appendLlmLog({
-      turnId: this.turnCounter,
+      turnId,
       kind: 'scheduler',
       eventType: 'system_alert',
       sourceType: 'system',
-      sourceId: 'brain:context',
-      tags: ['context', 'enter'],
-      text: `Entered context: "${normalizedLabel}"`,
+      sourceId: 'brain:handoff',
+      tags: ['scheduler', 'handoff', 'triggered'],
+      text: `Context handoff triggered (~${estimatedTokens} tokens). LLM will write memories before reset.`,
     })
 
-    return { ok: true, label: normalizedLabel, turnId: this.turnCounter }
-  }
+    // Build handoff prompt
+    const handoffPrompt = `[CONTEXT_HANDOFF] Your conversation history has grown to ~${estimatedTokens} tokens.
 
-  /**
-   * Exit the current task context, summarize it, and archive it.
-   * Called by the LLM via REPL or internally for auto-trim.
-   */
-  public exitContext(summary?: string): { ok: true, summarized: string, messagesArchived: number } {
-    return this.exitCurrentContext(
-      typeof summary === 'string' && summary.trim() ? summary.trim() : undefined,
-      'explicit',
-    )
-  }
+Before resetting to a fresh context window, you must preserve critical information for your future self.
 
-  private exitCurrentContext(
-    providedSummary: string | undefined,
-    reason: 'explicit' | 'auto_exit_on_enter' | 'auto_trim',
-  ): { ok: true, summarized: string, messagesArchived: number } {
-    const activeMessages = this.conversationHistory.slice(this.activeContextStartIndex)
-    const startTurnId = this.activeContextState.startTurnId
-    const endTurnId = this.turnCounter
-    const label = this.activeContextState.label || 'unnamed'
+Use the REPL to write memories about:
+1. Current active tasks and their progress
+2. Important environmental discoveries (ore locations, base coordinates, etc.)
+3. Player preferences and instructions
+4. Inventory state and resource availability
+5. Any ongoing multi-step plans
 
-    // Generate summary: prefer LLM-provided, fall back to heuristic
-    const summaryText = providedSummary || generateContextSummary({
-      messages: activeMessages,
-      label,
-      llmLogEntries: this.llmLogEntries,
-      startTurnId,
-      endTurnId,
-    })
+After writing memories, the conversation will reset. Your full history will remain accessible via history.search() and history.recent() for precise lookback.
 
-    const archived: ArchivedContext = {
-      label,
-      summary: summaryText,
-      startTurnId,
-      endTurnId,
-      messageCount: activeMessages.length,
-      archivedAt: Date.now(),
+Example:
+mem.currentTask = { type: 'mining', target: 'diamonds', progress: 'found cave at (120, 12, -45)' }
+mem.baseCoords = { x: 100, y: 70, z: -30 }
+mem.playerPrefs = { name: 'laggy_magpie', wantsIronTools: true }`
+
+    // Store snapshot for history queries
+    const preHandoffMessageCount = this.conversationHistory.length
+
+    try {
+      // Call LLM with handoff prompt
+      const systemPrompt = generateBrainSystemPrompt(this.deps.taskExecutor.getAvailableActions())
+      const messages: Message[] = [
+        { role: 'system', content: systemPrompt },
+        ...this.conversationHistory,
+        { role: 'user', content: handoffPrompt },
+      ]
+
+      const llmResult = await this.deps.llmAgent.callLLM({ messages })
+      const content = llmResult.text
+
+      if (content) {
+        // Execute the handoff script
+        const snapshot = this.deps.reflexManager.getContextSnapshot()
+        const actionDefs = new Map(this.deps.taskExecutor.getAvailableActions().map(action => [action.name, action]))
+        const normalizedCode = this.normalizeReplCode(content)
+        const codeToEvaluate = this.repl.canEvaluateAsExpression(normalizedCode)
+          ? `return (\n${normalizedCode}\n)`
+          : normalizedCode
+
+        await this.repl.evaluate(
+          codeToEvaluate,
+          this.deps.taskExecutor.getAvailableActions(),
+          this.createRuntimeGlobals(event, snapshot as unknown as Record<string, unknown>, bot),
+          async (action: ActionInstruction) => {
+            const actionDef = actionDefs.get(action.tool)
+            if (actionDef?.followControl === 'detach')
+              this.deps.reflexManager.clearFollowTarget()
+            return this.deps.taskExecutor.executeActionWithResult(action)
+          },
+        )
+
+        this.appendLlmLog({
+          turnId,
+          kind: 'scheduler',
+          eventType: 'system_alert',
+          sourceType: 'system',
+          sourceId: 'brain:handoff',
+          tags: ['scheduler', 'handoff', 'completed'],
+          text: `Handoff completed. Memories written. Resetting conversation (${preHandoffMessageCount} messages archived).`,
+        })
+      }
+    }
+    catch (err) {
+      this.deps.logger.withError(err as Error).error('Brain: Handoff LLM call or execution failed')
+      this.appendLlmLog({
+        turnId,
+        kind: 'scheduler',
+        eventType: 'system_alert',
+        sourceType: 'system',
+        sourceId: 'brain:handoff',
+        tags: ['scheduler', 'handoff', 'failed'],
+        text: `Handoff failed: ${toErrorMessage(err)}. Forcing reset anyway.`,
+      })
     }
 
-    this.archivedContexts.push(archived)
+    // Reset conversation history
+    this.conversationHistory = []
+    this.lastLlmInputSnapshot = null
+    this.isHandoffInProgress = false
 
-    // Collapse oldest contexts if prefix is too large
-    if (this.archivedContexts.length > MAX_CONTEXT_SUMMARIES_IN_PREFIX) {
-      const collapseCount = this.archivedContexts.length - MAX_CONTEXT_SUMMARIES_IN_PREFIX + 1
-      this.archivedContexts = collapseOldestContexts(this.archivedContexts, collapseCount)
-    }
-
-    // Invalidate the cached prefix message so it's rebuilt next turn
-    this.cachedContextHistoryMessage = null
-
-    // Clear the active context messages from conversation history
-    // Keep them in memory for history queries but mark the new start index
-    this.activeContextStartIndex = this.conversationHistory.length
-
-    // Reset active context state
-    this.activeContextState = {
-      label: null,
-      startTurnId: this.turnCounter,
-      startedAt: Date.now(),
-    }
-
-    this.appendLlmLog({
-      turnId: this.turnCounter,
-      kind: 'scheduler',
-      eventType: 'system_alert',
-      sourceType: 'system',
-      sourceId: 'brain:context',
-      tags: ['context', 'exit', reason],
-      text: `Exited context: "${label}" (${activeMessages.length} messages archived). Summary: ${summaryText}`,
-      metadata: {
-        label,
-        reason,
-        messagesArchived: activeMessages.length,
-        summary: summaryText,
-        startTurnId,
-        endTurnId,
-      },
-    })
-
-    return {
-      ok: true,
-      summarized: summaryText,
-      messagesArchived: activeMessages.length,
-    }
-  }
-
-  /**
-   * Build the [CONTEXT_HISTORY] prefix message from archived contexts.
-   * Caches the result until invalidated by exitContext().
-   */
-  private getContextHistoryMessage(): string | null {
-    if (this.cachedContextHistoryMessage !== null)
-      return this.cachedContextHistoryMessage
-
-    const message = buildContextHistoryMessage(this.archivedContexts)
-    this.cachedContextHistoryMessage = message
-    return message
-  }
-
-  /**
-   * Auto-trim the active context if it exceeds the safety limit.
-   * Summarizes the oldest half and archives it.
-   */
-  private autoTrimActiveContext(): void {
-    const activeMessageCount = this.conversationHistory.length - this.activeContextStartIndex
-    if (activeMessageCount <= MAX_ACTIVE_CONTEXT_MESSAGES)
-      return
-
-    this.deps.logger.log('INFO', `Brain: Auto-trimming active context (${activeMessageCount} messages > ${MAX_ACTIVE_CONTEXT_MESSAGES} limit)`)
-
-    // Split: archive the oldest half, keep the newest half as active
-    const halfPoint = this.activeContextStartIndex + Math.floor(activeMessageCount / 2)
-    const oldMessages = this.conversationHistory.slice(this.activeContextStartIndex, halfPoint)
-
-    const summaryText = generateContextSummary({
-      messages: oldMessages,
-      label: this.activeContextState.label ? `${this.activeContextState.label} (partial)` : '(auto-trimmed)',
-      llmLogEntries: this.llmLogEntries,
-      startTurnId: this.activeContextState.startTurnId,
-      endTurnId: this.turnCounter,
-    })
-
-    const archived: ArchivedContext = {
-      label: this.activeContextState.label ? `${this.activeContextState.label} (partial)` : '(auto-trimmed)',
-      summary: summaryText,
-      startTurnId: this.activeContextState.startTurnId,
-      endTurnId: this.turnCounter,
-      messageCount: oldMessages.length,
-      archivedAt: Date.now(),
-    }
-
-    this.archivedContexts.push(archived)
-
-    if (this.archivedContexts.length > MAX_CONTEXT_SUMMARIES_IN_PREFIX) {
-      const collapseCount = this.archivedContexts.length - MAX_CONTEXT_SUMMARIES_IN_PREFIX + 1
-      this.archivedContexts = collapseOldestContexts(this.archivedContexts, collapseCount)
-    }
-
-    // Move the start index forward
-    this.activeContextStartIndex = halfPoint
-    this.cachedContextHistoryMessage = null
-
-    this.appendLlmLog({
-      turnId: this.turnCounter,
-      kind: 'scheduler',
-      eventType: 'system_alert',
-      sourceType: 'system',
-      sourceId: 'brain:context',
-      tags: ['context', 'auto_trim'],
-      text: `Auto-trimmed active context: archived ${oldMessages.length} messages`,
-      metadata: {
-        archivedCount: oldMessages.length,
-        remainingActive: this.conversationHistory.length - halfPoint,
-        summary: summaryText,
-      },
-    })
+    this.deps.logger.log('INFO', `Brain: Context handoff complete. ${preHandoffMessageCount} messages archived, conversation reset.`)
   }
 
   public async injectDebugEvent(event: BotEvent): Promise<void> {
@@ -813,6 +729,22 @@ export class Brain {
     return JSON.parse(JSON.stringify(messages)) as Message[]
   }
 
+  private toDebugMessages(messages: Message[]): Array<{ role: string, content: string, reasoning?: string }> {
+    return messages.map((msg) => {
+      const content = typeof msg.content === 'string' ? msg.content : String(msg.content)
+      const result: { role: string, content: string, reasoning?: string } = {
+        role: msg.role,
+        content,
+      }
+      // Include reasoning if present
+      const reasoning = (msg as any).reasoning
+      if (typeof reasoning === 'string') {
+        result.reasoning = reasoning
+      }
+      return result
+    })
+  }
+
   /**
    * Re-emit the current conversation state with full context metadata.
    * Used by the debug dashboard's `request_conversation` handler on reconnect.
@@ -823,22 +755,9 @@ export class Brain {
 
   private emitConversationUpdate(isProcessing: boolean, sessionBoundary?: boolean): void {
     this.debugService.emitConversationUpdate({
-      messages: this.cloneMessages(this.conversationHistory),
+      messages: this.toDebugMessages(this.conversationHistory),
       isProcessing,
       ...(sessionBoundary && { sessionBoundary }),
-      activeContext: {
-        label: this.activeContextState.label,
-        startTurnId: this.activeContextState.startTurnId,
-        messageCount: this.conversationHistory.length - this.activeContextStartIndex,
-      },
-      archivedContexts: this.archivedContexts.map(ctx => ({
-        label: ctx.label,
-        summary: ctx.summary,
-        turns: ctx.endTurnId - ctx.startTurnId + 1,
-        archivedAt: ctx.archivedAt,
-      })),
-      activeContextStartIndex: this.activeContextStartIndex,
-      contextHistoryMessage: this.getContextHistoryMessage(),
     })
   }
 
@@ -863,8 +782,6 @@ export class Brain {
       setNoActionBudget: (value: number) => this.setNoActionFollowupBudget(value),
       getNoActionBudget: () => this.getNoActionBudgetState(),
       forgetConversation: () => this.forgetConversation(),
-      enterContext: (label: string) => this.enterContext(label),
-      exitContext: (summary?: string) => this.exitContext(summary),
       history: this.historyRuntime,
     }
   }
@@ -1827,7 +1744,7 @@ export class Brain {
     })
 
     this.debugService.emitConversationUpdate({
-      messages: this.cloneMessages([
+      messages: this.toDebugMessages([
         ...this.conversationHistory,
         { role: 'user', content: userMessage },
       ]),
@@ -1857,16 +1774,17 @@ export class Brain {
       }
 
       try {
-        // Auto-trim active context if it exceeds the safety limit
-        this.autoTrimActiveContext()
+        // Check if handoff is needed before building prompt
+        const estimatedTokens = this.estimateConversationTokens()
+        if (estimatedTokens >= HANDOFF_TOKEN_THRESHOLD && !this.isHandoffInProgress) {
+          await this.triggerContextHandoff(bot, event)
+          return // Skip normal processing this turn
+        }
 
-        // Build messages: system + [CONTEXT_HISTORY prefix] + active context messages + new user message
-        const contextHistoryMsg = this.getContextHistoryMessage()
-        const activeMessages = this.conversationHistory.slice(this.activeContextStartIndex)
+        // Build messages: system + conversation history + new user message
         const messages: Message[] = [
           { role: 'system', content: systemPrompt },
-          ...(contextHistoryMsg ? [{ role: 'user' as const, content: contextHistoryMsg }] : []),
-          ...activeMessages,
+          ...this.conversationHistory,
           { role: 'user', content: userMessage },
         ]
         this.lastLlmInputSnapshot = {
@@ -1922,7 +1840,7 @@ export class Brain {
           duration: Date.now() - traceStart,
         })
         // Store lightweight trace (no full messages clone to prevent O(turns²) memory)
-        const estimatedTokens = Math.ceil(messages.reduce((sum, m) => {
+        const promptTokens = Math.ceil(messages.reduce((sum, m) => {
           const c = typeof m.content === 'string' ? m.content.length : 0
           return sum + c
         }, 0) / 4)
@@ -1936,7 +1854,7 @@ export class Brain {
           attempt,
           model: config.openai.model,
           messageCount: messages.length,
-          estimatedTokens,
+          estimatedTokens: promptTokens,
           content,
           reasoning,
           usage: llmResult.usage,
@@ -2054,13 +1972,11 @@ export class Brain {
       } as Message)
 
       // Trim conversation history as an in-memory safety net.
-      // The active context boundary system handles LLM context window sizing;
-      // this only prevents unbounded memory growth for very long sessions.
+      // This prevents unbounded memory growth for very long sessions.
+      // Note: The handoff mechanism handles LLM context window sizing.
       if (this.conversationHistory.length > MAX_CONVERSATION_HISTORY_MESSAGES) {
         const trimCount = this.conversationHistory.length - MAX_CONVERSATION_HISTORY_MESSAGES
         this.conversationHistory = this.conversationHistory.slice(trimCount)
-        // Adjust the active context start index to account for removed messages
-        this.activeContextStartIndex = Math.max(0, this.activeContextStartIndex - trimCount)
       }
 
       const actionDefs = new Map(this.deps.taskExecutor.getAvailableActions().map(action => [action.name, action]))
@@ -2279,17 +2195,6 @@ export class Brain {
     // (inactive state is the default and doesn't need to be stated every turn)
     if (this.errorBurstGuardState) {
       parts.push(`[ERROR_BURST] active=yes`)
-    }
-
-    // Context boundary status — reminds the model to use enterContext/exitContext
-    const activeLabel = this.activeContextState.label
-    const activeCount = this.conversationHistory.length - this.activeContextStartIndex
-    const archivedCount = this.archivedContexts.length
-    if (activeLabel) {
-      parts.push(`[CONTEXT] active="${activeLabel}" (${activeCount} messages); archived=${archivedCount}`)
-    }
-    else {
-      parts.push(`[CONTEXT] no active context (${activeCount} messages unmanaged); archived=${archivedCount}. Remember: call enterContext('label') when starting a task.`)
     }
 
     return parts.join('\n\n')

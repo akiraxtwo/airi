@@ -1,6 +1,5 @@
 import type { Message } from '@xsai/shared-chat'
 
-import type { ArchivedContext } from './context-summary'
 import type { LlmLogEntry } from './llm-log'
 
 /**
@@ -16,7 +15,6 @@ export interface TurnSummary {
 
 interface HistoryQueryDeps {
   getConversationHistory: () => readonly Message[]
-  getArchivedContexts: () => readonly ArchivedContext[]
   getLlmLogEntries: () => readonly LlmLogEntry[]
   getCurrentTurnId: () => number
 }
@@ -24,8 +22,7 @@ interface HistoryQueryDeps {
 /**
  * Creates the `history` runtime object exposed to the REPL sandbox.
  * Provides search-oriented access to the full conversation history
- * (both active context and archived contexts) without requiring all
- * messages to be in the LLM prompt.
+ * without requiring all messages to be in the LLM prompt.
  */
 export function createHistoryRuntime(deps: HistoryQueryDeps) {
   return {
@@ -51,37 +48,23 @@ export function createHistoryRuntime(deps: HistoryQueryDeps) {
     },
 
     /**
-     * Text search across ALL history (archived summaries + active messages).
+     * Text search across conversation history.
      * Returns matching messages with their role and a content snippet.
      */
-    search(query: string, maxResults = 10): Array<{ role: string, content: string, source: 'active' | 'archived' }> {
+    search(query: string, maxResults = 10): Array<{ role: string, content: string }> {
       if (!query || typeof query !== 'string')
         return []
 
       const needle = query.toLowerCase()
-      const results: Array<{ role: string, content: string, source: 'active' | 'archived' }> = []
+      const results: Array<{ role: string, content: string }> = []
 
-      // Search archived context summaries
-      for (const ctx of deps.getArchivedContexts()) {
-        if (ctx.summary.toLowerCase().includes(needle) || (ctx.label && ctx.label.toLowerCase().includes(needle))) {
-          results.push({
-            role: 'context',
-            content: `[${ctx.label || 'unnamed'}] ${ctx.summary}`,
-            source: 'archived',
-          })
-          if (results.length >= maxResults)
-            return results
-        }
-      }
-
-      // Search active conversation history
+      // Search conversation history
       for (const msg of deps.getConversationHistory()) {
         const content = typeof msg.content === 'string' ? msg.content : String(msg.content)
         if (content.toLowerCase().includes(needle)) {
           results.push({
             role: msg.role,
             content: content.length > 300 ? `${content.slice(0, 297)}...` : content,
-            source: 'active',
           })
           if (results.length >= maxResults)
             return results
@@ -160,38 +143,7 @@ export function createHistoryRuntime(deps: HistoryQueryDeps) {
     },
 
     /**
-     * List all archived context summaries.
-     */
-    contexts(): Array<{ label: string, summary: string, turns: number, archivedAt: number }> {
-      return deps.getArchivedContexts().map(ctx => ({
-        label: ctx.label,
-        summary: ctx.summary,
-        turns: ctx.endTurnId - ctx.startTurnId + 1,
-        archivedAt: ctx.archivedAt,
-      }))
-    },
-
-    /**
-     * Get a specific archived context by label (partial match).
-     */
-    context(label: string): { label: string, summary: string, turns: number } | null {
-      if (!label || typeof label !== 'string')
-        return null
-      const needle = label.toLowerCase()
-      const found = deps.getArchivedContexts().find(
-        ctx => ctx.label.toLowerCase().includes(needle),
-      )
-      if (!found)
-        return null
-      return {
-        label: found.label,
-        summary: found.summary,
-        turns: found.endTurnId - found.startTurnId + 1,
-      }
-    },
-
-    /**
-     * Total message count in the active conversation history.
+     * Total message count in the conversation history.
      */
     count(): number {
       return deps.getConversationHistory().length
