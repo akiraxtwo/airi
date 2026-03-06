@@ -1,0 +1,32 @@
+[
+  {
+    "id": "demo-001",
+    "name": "Telesin 運動相機配件套裝",
+    "price": 599,
+    "currency": "TWD",
+    "description": "適用於 GoPro / DJI Action 系列，包含自拍桿、胸帶、頭帶等多種配件",
+    "stock": 50,
+    "discount": "直播限定 85 折",
+    "keywords": ["相機", "配件", "GoPro", "運動", "自拍桿"]
+  },
+  {
+    "id": "demo-002",
+    "name": "Telesin 防水殼",
+    "price": 399,
+    "currency": "TWD",
+    "description": "50 米深度防水，適用於 GoPro Hero 12/11/10/9",
+    "stock": 30,
+    "discount": "買一送一",
+    "keywords": ["防水", "GoPro", "潛水", "保護殼"]
+  },
+  {
+    "id": "demo-003",
+    "name": "Telesin 快充電池組",
+    "price": 899,
+    "currency": "TWD",
+    "description": "三充座 + 三顆電池，Type-C 快充，LED 電量顯示",
+    "stock": 100,
+    "discount": "限時特價 799",
+    "keywords": ["電池", "充電", "快充", "GoPro"]
+  }
+]
