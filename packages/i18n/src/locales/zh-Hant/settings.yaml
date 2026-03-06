@@ -752,6 +752,34 @@ pages:
       description: Full address of the WebSocket server (e.g., ws://localhost:6121/ws)
       label: WebSocket Server Address
       placeholder: ws://localhost:6121/ws
+  mcp:
+    title: MCP 伺服器
+    description: 連接外部 MCP（Model Context Protocol）伺服器
+    server-cmd:
+      label: 伺服器指令
+      description: 啟動 MCP 伺服器的指令（例如 npx）
+      placeholder: npx
+    server-args:
+      label: 伺服器參數
+      description: MCP 伺服器指令的參數
+      placeholder: tsx --env-file=.env.local src/stdio.ts
+    server-cwd:
+      label: 工作目錄
+      description: MCP 伺服器的工作目錄
+      placeholder: services/shopee-live
+    server-prompt:
+      label: 角色 Prompt
+      description: MCP 伺服器連線後自動注入到 AI 對話 context
+      placeholder: 輸入 AI 使用 MCP 工具時的角色指示...
+    connect: 連接
+    disconnect: 斷開
+    status:
+      connected: 已連接
+      disconnected: 未連接
+      connecting: 連接中...
+    tools:
+      title: 可用工具
+      empty: 沒有可用的工具。請先連接伺服器。
   scene:
     description: 設定角色所在環境
     title: 場景

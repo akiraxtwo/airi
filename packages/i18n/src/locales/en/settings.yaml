@@ -775,6 +775,34 @@ pages:
   connection:
     description: Configure WebSocket server connection
     title: Connection
+  mcp:
+    title: MCP Server
+    description: Connect to external MCP (Model Context Protocol) servers
+    server-cmd:
+      label: Server Command
+      description: Command to start the MCP server (e.g., npx)
+      placeholder: npx
+    server-args:
+      label: Server Arguments
+      description: Arguments for the MCP server command
+      placeholder: tsx --env-file=.env.local src/stdio.ts
+    server-cwd:
+      label: Working Directory
+      description: Working directory for the MCP server
+      placeholder: services/shopee-live
+    server-prompt:
+      label: Role Prompt
+      description: Injected into AI context when MCP server is connected
+      placeholder: Enter role instructions for the AI when using MCP tools...
+    connect: Connect
+    disconnect: Disconnect
+    status:
+      connected: Connected
+      disconnected: Disconnected
+      connecting: Connecting...
+    tools:
+      title: Available Tools
+      empty: No tools available. Connect to a server first.
     websocket-url:
       description: Full address of the WebSocket server (e.g., ws://localhost:6121/ws)
       label: WebSocket Server Address
