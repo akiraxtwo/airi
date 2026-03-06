@@ -14,6 +14,7 @@ import { openDebugger, setupDebugger } from './app/debugger'
 import { emitAppBeforeQuit, emitAppReady, emitAppWindowAllClosed } from './libs/bootkit/lifecycle'
 import { setElectronMainDirname } from './libs/electron/location'
 import { setupServerChannelHandlers } from './services/airi/channel-server'
+import { setupMcpService } from './services/airi/mcp'
 import { setupPluginHost } from './services/airi/plugins'
 import { setupAutoUpdater } from './services/electron/auto-updater'
 import { setupTray } from './tray'
@@ -74,6 +75,7 @@ app.whenReady().then(async () => {
   injeca.setLogger(createLoggLogger(useLogg('injeca').useGlobalConfig()))
 
   const serverChannel = injeca.provide('modules:channel-server', () => setupServerChannelHandlers())
+  const mcpService = injeca.provide('modules:mcp', () => setupMcpService())
   const pluginHost = injeca.provide('modules:plugin-host', () => setupPluginHost())
   const autoUpdater = injeca.provide('services:auto-updater', () => setupAutoUpdater())
   const widgetsManager = injeca.provide('windows:widgets', () => setupWidgetsWindowManager())
@@ -113,7 +115,7 @@ app.whenReady().then(async () => {
   })
 
   injeca.invoke({
-    dependsOn: { mainWindow, tray, serverChannel, pluginHost },
+    dependsOn: { mainWindow, tray, serverChannel, mcpService, pluginHost },
     callback: noop,
   })
 

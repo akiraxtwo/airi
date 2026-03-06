@@ -19,6 +19,7 @@ import { createChatHooks } from './chat/hooks'
 import { useChatSessionStore } from './chat/session-store'
 import { useChatStreamStore } from './chat/stream-store'
 import { useLLM } from './llm'
+import { useMcpStore } from './mcp'
 import { useConsciousnessStore } from './modules/consciousness'
 
 interface SendOptions {
@@ -275,6 +276,26 @@ export const useChatOrchestratorStore = defineStore('chat-orchestrator', () => {
                 text: ''
                   + 'These are the contextual information retrieved or on-demand updated from other modules, you may use them as context for chat, or reference of the next action, tool call, etc.:\n'
                   + `${Object.entries(contextsSnapshot).map(([key, value]) => `Module ${key}: ${JSON.stringify(value)}`).join('\n')}\n`,
+              },
+            ],
+          },
+          ...afterSystem,
+        ]
+      }
+
+      // Inject MCP server prompt as context if connected
+      const mcpStore = useMcpStore()
+      if (mcpStore.connected && mcpStore.serverPrompt) {
+        const system = newMessages.slice(0, 1)
+        const afterSystem = newMessages.slice(1)
+        newMessages = [
+          ...system,
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `[MCP Server Role Prompt]\n${mcpStore.serverPrompt}`,
               },
             ],
           },

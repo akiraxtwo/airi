@@ -138,5 +138,28 @@ export const widgetsRemoveEvent = defineEventa<{ id: string }>('eventa:event:ele
 export const widgetsClearEvent = defineEventa('eventa:event:electron:windows:widgets:clear')
 export const widgetsUpdateEvent = defineEventa<{ id: string, componentProps?: Record<string, any> }>('eventa:event:electron:windows:widgets:update')
 
+// ── MCP (Model Context Protocol) ──
+
+export interface McpTool {
+  name: string
+  description: string
+  inputSchema: {
+    required: string[]
+    title: string
+    type: 'object'
+    properties: Record<string, { title: string, type: string, default?: any }>
+  }
+}
+
+export interface McpCallToolResult {
+  content: { type: string, text: string }[]
+  isError: boolean
+}
+
+export const electronMcpConnect = defineInvokeEventa<void, { command: string, args: string[], cwd?: string }>('eventa:invoke:electron:mcp:connect')
+export const electronMcpDisconnect = defineInvokeEventa('eventa:invoke:electron:mcp:disconnect')
+export const electronMcpListTools = defineInvokeEventa<McpTool[]>('eventa:invoke:electron:mcp:list-tools')
+export const electronMcpCallTool = defineInvokeEventa<McpCallToolResult, { name: string, args?: Record<string, unknown> }>('eventa:invoke:electron:mcp:call-tool')
+
 export { electron } from '@proj-airi/electron-eventa'
 export * from '@proj-airi/electron-eventa/electron-updater'
